@@ -638,33 +638,108 @@ async function runLogin() {
   return true;
 }
 
-// ─── Input Handler ──────────────────────────────────────────────────────────
+// ─── Input Handler (raw mode for instant / detection) ───────────────────────
 
-function getInput(prompt) {
+function readLine(promptStr) {
+  // Simple readline for non-TTY or tool confirmations
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
     let answered = false;
-    rl.question(prompt, (answer) => {
-      answered = true;
-      rl.close();
-      resolve(answer);
-    });
-    rl.on("close", () => {
-      if (!answered) resolve(null); // only null on Ctrl+D / EOF
-    });
+    rl.question(promptStr, (answer) => { answered = true; rl.close(); resolve(answer); });
+    rl.on("close", () => { if (!answered) resolve(null); });
   });
 }
 
-async function getMultilineInput() {
-  console.log(chalk.dim("  Multi-line mode. Type ``` on a new line to finish.\n"));
-  const lines = [];
-  while (true) {
-    const line = await getInput(chalk.dim("  ... "));
-    if (line === null) return null;
-    if (line.trim() === "```") break;
-    lines.push(line);
-  }
-  return lines.join("\n");
+/**
+ * Raw-mode input: detects `/` instantly on first keypress.
+ * Returns { text, isSlash } or null on EOF.
+ */
+function rawInput() {
+  return new Promise((resolve) => {
+    let buf = "";
+
+    process.stdout.write(chalk.cyan.bold("\n> "));
+
+    if (!process.stdin.isTTY) {
+      // Fallback for piped input
+      const rl = readline.createInterface({ input: process.stdin });
+      rl.once("line", (line) => { rl.close(); resolve({ text: line.trim(), isSlash: false }); });
+      rl.once("close", () => resolve(null));
+      return;
+    }
+
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    function cleanup() {
+      process.stdin.removeListener("data", onKey);
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    }
+
+    function onKey(data) {
+      const code = data[0];
+
+      // Ctrl+D -> EOF
+      if (code === 4) { cleanup(); process.stdout.write("\n"); resolve(null); return; }
+
+      // Ctrl+C -> cancel
+      if (code === 3) { cleanup(); process.stdout.write("\n"); resolve({ text: "", isSlash: false }); return; }
+
+      // Enter -> submit
+      if (code === 13) {
+        cleanup();
+        process.stdout.write("\n");
+        resolve({ text: buf.trim(), isSlash: false });
+        return;
+      }
+
+      // Backspace
+      if (code === 127 || code === 8) {
+        if (buf.length > 0) {
+          buf = buf.slice(0, -1);
+          process.stdout.write("\b \b");
+        }
+        return;
+      }
+
+      // Escape sequences (arrows etc) -> ignore
+      if (code === 27) return;
+
+      // Tab -> ignore
+      if (code === 9) return;
+
+      // Printable character
+      if (code >= 32 && code < 127) {
+        const ch = data.toString();
+        buf += ch;
+        process.stdout.write(ch);
+
+        // INSTANT SLASH DETECTION: if "/" is the very first char
+        if (buf === "/") {
+          cleanup();
+          process.stdout.write("\n");
+          resolve({ text: "/", isSlash: true });
+          return;
+        }
+      }
+    }
+
+    process.stdin.on("data", onKey);
+  });
+}
+
+function getMultilineInput() {
+  return new Promise(async (resolve) => {
+    console.log(chalk.dim("  Multi-line mode. Type ``` on a new line to finish.\n"));
+    const lines = [];
+    while (true) {
+      const line = await readLine(chalk.dim("  ... "));
+      if (line === null) { resolve(null); return; }
+      if (line.trim() === "```") break;
+      lines.push(line);
+    }
+    resolve(lines.join("\n"));
+  });
 }
 
 // ─── Main REPL ──────────────────────────────────────────────────────────────
@@ -702,44 +777,33 @@ async function repl(config) {
 
   // REPL loop
   while (true) {
-    const raw = await getInput(chalk.cyan.bold("\n> "));
-    if (raw === null) {
-      console.log(chalk.dim("\n  Goodbye!"));
+    const input = await rawInput();
+    if (input === null) {
+      console.log(chalk.dim("  Goodbye!"));
       break;
     }
+    if (!input.text) continue;
 
-    const input = raw.trim();
-    if (!input) continue;
+    // Slash: "/" detected instantly on keypress -> show menu
+    if (input.isSlash) {
+      const cmd = await showSlashMenu();
+      if (cmd) handleSlashCommand(cmd, ctx);
+      continue;
+    }
 
-    // Slash command trigger
-    if (input === "/" || input.startsWith("/")) {
-      if (input === "/") {
-        const cmd = await showSlashMenu();
-        if (cmd) handleSlashCommand(cmd, ctx);
-      } else {
-        // Direct slash command (e.g., "/help")
-        const match = SLASH_COMMANDS.find((c) => c.name === input);
-        if (match) {
-          handleSlashCommand(match.name, ctx);
-        } else {
-          // Try partial match
-          const partial = SLASH_COMMANDS.filter((c) => c.name.startsWith(input));
-          if (partial.length === 1) {
-            handleSlashCommand(partial[0].name, ctx);
-          } else if (partial.length > 1) {
-            console.log(chalk.yellow(`  Ambiguous. Did you mean: ${partial.map((c) => c.name).join(", ")}?`));
-          } else {
-            console.log(chalk.yellow(`  Unknown command: ${input}. Type / to see all commands.`));
-          }
-        }
-        continue;
-      }
+    // Direct slash command typed fully (e.g. "/help" then Enter)
+    if (input.text.startsWith("/")) {
+      const match = SLASH_COMMANDS.find((c) => c.name === input.text);
+      if (match) { handleSlashCommand(match.name, ctx); continue; }
+      const partial = SLASH_COMMANDS.filter((c) => c.name.startsWith(input.text));
+      if (partial.length === 1) { handleSlashCommand(partial[0].name, ctx); continue; }
+      console.log(chalk.yellow(`  Unknown command: ${input.text}. Type / to see all.`));
       continue;
     }
 
     // Multi-line mode
-    let userText = input;
-    if (input === "```") {
+    let userText = input.text;
+    if (input.text === "```") {
       const multi = await getMultilineInput();
       if (!multi) continue;
       userText = multi;
