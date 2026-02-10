@@ -22,7 +22,6 @@ import { execSync } from "child_process";
 import readline from "readline";
 import chalk from "chalk";
 import inquirer from "inquirer";
-import inquirerAutocomplete from "inquirer-autocomplete-prompt";
 import ora from "ora";
 import dotenv from "dotenv";
 
@@ -44,10 +43,6 @@ const IGNORED_DIRS = new Set([
   "coverage", ".pytest_cache", ".mypy_cache", "vendor", ".idea",
   ".vscode", ".DS_Store", "env", ".env", ".tox", "out",
 ]);
-
-// ─── Register Inquirer Plugin ───────────────────────────────────────────────
-
-inquirer.registerPrompt("autocomplete", inquirerAutocomplete);
 
 // ─── Config: ~/.chalk/.env ──────────────────────────────────────────────────
 
@@ -292,34 +287,106 @@ const SLASH_COMMANDS = [
 ];
 
 async function showSlashMenu() {
-  const choices = SLASH_COMMANDS.map((c) => ({
-    name: `${chalk.cyan(c.name.padEnd(14))} ${chalk.dim(c.description)}`,
-    value: c.name,
-    short: c.name,
-  }));
+  return new Promise((resolve) => {
+    let filter = "";
+    let selected = 0;
+    let filtered = [...SLASH_COMMANDS];
 
-  try {
-    const { command } = await inquirer.prompt([
-      {
-        type: "autocomplete",
-        name: "command",
-        message: "Command:",
-        source: (_answers, input) => {
-          const term = (input || "").replace(/^\//, "").toLowerCase();
-          if (!term) return choices;
-          return choices.filter(
-            (c) =>
-              c.value.slice(1).includes(term) ||
-              SLASH_COMMANDS.find((s) => s.name === c.value)?.description.toLowerCase().includes(term)
-          );
-        },
-        pageSize: SLASH_COMMANDS.length,
-      },
-    ]);
-    return command;
-  } catch {
-    return null; // user cancelled (Ctrl+C)
-  }
+    if (!process.stdin.isTTY) { resolve(null); return; }
+
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    function render(clear) {
+      if (clear) {
+        // Move up and clear previous render
+        const lines = filtered.length + 2;
+        process.stdout.write(`\x1b[${lines}A\x1b[J`);
+      }
+      process.stdout.write(`  ${chalk.dim("/")}${chalk.cyan(filter)}\n\n`);
+      if (filtered.length === 0) {
+        process.stdout.write(chalk.dim("  No matching commands\n"));
+      } else {
+        for (let i = 0; i < filtered.length; i++) {
+          const c = filtered[i];
+          const name = c.name.padEnd(14);
+          if (i === selected) {
+            process.stdout.write(`  ${chalk.cyan.bold(name)} ${chalk.white(c.description)}\n`);
+          } else {
+            process.stdout.write(`  ${chalk.dim(name)} ${chalk.dim(c.description)}\n`);
+          }
+        }
+      }
+    }
+
+    function cleanup() {
+      process.stdin.removeListener("data", onKey);
+      if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw ?? false);
+      // Clear menu
+      const lines = filtered.length + 2;
+      process.stdout.write(`\x1b[${lines}A\x1b[J`);
+    }
+
+    function updateFilter() {
+      const term = filter.toLowerCase();
+      filtered = SLASH_COMMANDS.filter(
+        (c) => c.name.slice(1).includes(term) || c.description.toLowerCase().includes(term)
+      );
+      selected = 0;
+    }
+
+    function onKey(data) {
+      const code = data[0];
+
+      // Escape or Ctrl+C -> cancel
+      if ((code === 27 && data.length === 1) || code === 3) {
+        cleanup();
+        resolve(null);
+        return;
+      }
+
+      // Enter -> select
+      if (code === 13) {
+        const choice = filtered[selected] || null;
+        cleanup();
+        resolve(choice ? choice.name : null);
+        return;
+      }
+
+      // Backspace
+      if (code === 127 || code === 8) {
+        if (filter.length > 0) {
+          filter = filter.slice(0, -1);
+          updateFilter();
+          render(true);
+        } else {
+          cleanup();
+          resolve(null);
+        }
+        return;
+      }
+
+      // Arrow keys
+      if (code === 27 && data.length >= 3) {
+        if (data[2] === 65) selected = Math.max(0, selected - 1);           // Up
+        if (data[2] === 66) selected = Math.min(filtered.length - 1, selected + 1); // Down
+        render(true);
+        return;
+      }
+
+      // Printable char
+      if (code >= 32 && code < 127) {
+        filter += data.toString();
+        updateFilter();
+        render(true);
+        return;
+      }
+    }
+
+    render(false);
+    process.stdin.on("data", onKey);
+  });
 }
 
 function handleSlashCommand(command, ctx) {
