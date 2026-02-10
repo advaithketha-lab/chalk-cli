@@ -1,0 +1,11 @@
+node_modules/
+dist/
+logs/
+sessions/
+.env
+coverage/
+*.tsbuildinfo
+rust-backend/target/
+__pycache__/
+.pytest_cache/
+*.pyc
