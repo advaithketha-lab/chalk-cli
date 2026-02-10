@@ -389,7 +389,278 @@ async function showSlashMenu() {
   });
 }
 
-function handleSlashCommand(command, ctx) {
+// ─── Box UI helpers (Claude Code style bordered dialogs) ────────────────────
+
+const BOX_WIDTH = 72;
+
+function boxTop()    { return chalk.dim("  +" + "-".repeat(BOX_WIDTH) + "+"); }
+function boxBottom() { return chalk.dim("  +" + "-".repeat(BOX_WIDTH) + "+"); }
+function boxLine(text, pad = true) {
+  const plain = text.replace(/\x1b\[[0-9;]*m/g, ""); // strip ANSI for length
+  const remaining = BOX_WIDTH - (pad ? 2 : 0) - plain.length;
+  const space = remaining > 0 ? " ".repeat(remaining) : "";
+  return chalk.dim("  |") + (pad ? " " : "") + text + space + (pad ? " " : "") + chalk.dim("|");
+}
+function boxEmpty() { return chalk.dim("  |") + " ".repeat(BOX_WIDTH) + chalk.dim("|"); }
+
+/**
+ * Generic raw-mode selector inside a box.
+ * Returns selected index or -1 on Esc.
+ */
+function boxSelect(title, subtitle, items, footer) {
+  return new Promise((resolve) => {
+    let selected = 0;
+
+    if (!process.stdin.isTTY) { resolve(0); return; }
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    function render(clear) {
+      const totalLines = items.length + 6 + (subtitle ? 1 : 0) + (footer ? 2 : 0);
+      if (clear) process.stdout.write(`\x1b[${totalLines}A\x1b[J`);
+
+      console.log(boxTop());
+      console.log(boxLine(chalk.bold(title)));
+      if (subtitle) console.log(boxLine(chalk.dim(subtitle)));
+      console.log(boxEmpty());
+      for (let i = 0; i < items.length; i++) {
+        const prefix = i === selected ? chalk.cyan("> ") : "  ";
+        const label = i === selected ? chalk.white(items[i]) : chalk.dim(items[i]);
+        console.log(boxLine(prefix + label));
+      }
+      console.log(boxEmpty());
+      console.log(boxBottom());
+      if (footer) {
+        console.log("");
+        console.log(chalk.dim(`  ${footer}`));
+      }
+    }
+
+    function cleanup() {
+      process.stdin.removeListener("data", onKey);
+      if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw ?? false);
+    }
+
+    function onKey(data) {
+      const code = data[0];
+      if ((code === 27 && data.length === 1) || code === 3) { cleanup(); resolve(-1); return; }
+      if (code === 13) { cleanup(); resolve(selected); return; }
+      if (code === 27 && data.length >= 3) {
+        if (data[2] === 65) selected = Math.max(0, selected - 1);
+        if (data[2] === 66) selected = Math.min(items.length - 1, selected + 1);
+        render(true);
+      }
+    }
+
+    render(false);
+    process.stdin.on("data", onKey);
+  });
+}
+
+/**
+ * Text input inside a box. Returns string or null on Esc.
+ */
+function boxTextInput(title, subtitle, placeholder) {
+  return new Promise((resolve) => {
+    let buf = "";
+
+    if (!process.stdin.isTTY) { resolve(null); return; }
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    function render(clear) {
+      const totalLines = 7;
+      if (clear) process.stdout.write(`\x1b[${totalLines}A\x1b[J`);
+
+      console.log(boxTop());
+      console.log(boxLine(chalk.bold(title)));
+      console.log(boxLine(chalk.dim(subtitle)));
+      console.log(boxEmpty());
+      const display = buf || chalk.dim(placeholder || "");
+      console.log(boxLine(display));
+      console.log(boxEmpty());
+      console.log(boxBottom());
+    }
+
+    function cleanup() {
+      process.stdin.removeListener("data", onKey);
+      if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw ?? false);
+    }
+
+    function onKey(data) {
+      const code = data[0];
+      if ((code === 27 && data.length === 1) || code === 3) { cleanup(); resolve(null); return; }
+      if (code === 13) { cleanup(); resolve(buf); return; }
+      if (code === 127 || code === 8) { if (buf.length > 0) { buf = buf.slice(0, -1); render(true); } return; }
+      if (code >= 32 && code < 127) { buf += data.toString(); render(true); }
+    }
+
+    render(false);
+    process.stdin.on("data", onKey);
+  });
+}
+
+// ─── Agents System ──────────────────────────────────────────────────────────
+
+const AGENTS_DIR_PROJECT = path.join(process.cwd(), ".chalk", "agents");
+const AGENTS_DIR_PERSONAL = path.join(CHALK_HOME, "agents");
+
+const BUILTIN_AGENTS = [
+  { name: "Tool Runner",        model: "inherit", desc: "Executes shell commands via tool_run" },
+  { name: "File Editor",        model: "inherit", desc: "Creates and edits files via tool_edit" },
+  { name: "Code Reviewer",      model: "inherit", desc: "Reviews code for bugs and improvements" },
+  { name: "Security Reviewer",  model: "inherit", desc: "Checks code for security vulnerabilities" },
+];
+
+function loadCustomAgents() {
+  const agents = [];
+  for (const dir of [AGENTS_DIR_PROJECT, AGENTS_DIR_PERSONAL]) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+      for (const file of files) {
+        try {
+          const data = JSON.parse(fs.readFileSync(path.join(dir, file), "utf-8"));
+          agents.push({ ...data, location: dir === AGENTS_DIR_PROJECT ? "project" : "personal" });
+        } catch { /* skip bad files */ }
+      }
+    } catch { /* skip */ }
+  }
+  return agents;
+}
+
+function saveAgent(agent, location) {
+  const dir = location === "project" ? AGENTS_DIR_PROJECT : AGENTS_DIR_PERSONAL;
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const filename = agent.name.toLowerCase().replace(/\s+/g, "-") + ".json";
+  fs.writeFileSync(path.join(dir, filename), JSON.stringify(agent, null, 2), "utf-8");
+}
+
+async function showAgentsDialog() {
+  const custom = loadCustomAgents();
+
+  // Main agents screen
+  console.log("");
+  console.log(boxTop());
+  console.log(boxLine(chalk.bold("Agents")));
+  if (custom.length === 0) {
+    console.log(boxLine(chalk.dim("No custom agents found")));
+  } else {
+    console.log(boxLine(chalk.dim(`${custom.length} custom agent(s)`)));
+  }
+  console.log(boxEmpty());
+  console.log(boxLine(chalk.cyan("> Create new agent")));
+  console.log(boxEmpty());
+
+  // Show description
+  console.log(boxLine(chalk.dim("Create specialized subagents that Chalk can delegate to.")));
+  console.log(boxLine(chalk.dim("Each subagent has its own context window, custom system prompt,")));
+  console.log(boxLine(chalk.dim("and specific tools.")));
+  console.log(boxLine(chalk.dim("Try creating: Code Reviewer, Security Reviewer, Tech Lead.")));
+  console.log(boxEmpty());
+
+  // Built-in agents
+  console.log(boxLine(chalk.bold("Built-in (always available):")));
+  for (const a of BUILTIN_AGENTS) {
+    console.log(boxLine(`${chalk.white(a.name.padEnd(22))}${chalk.dim(a.model)}`));
+  }
+  console.log(boxEmpty());
+  console.log(boxBottom());
+  console.log(chalk.dim("\n  Press Enter to create - Esc to go back\n"));
+
+  // Wait for Enter or Esc
+  const action = await new Promise((resolve) => {
+    if (!process.stdin.isTTY) { resolve("esc"); return; }
+    const wasRaw = process.stdin.isRaw;
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    function onKey(data) {
+      const code = data[0];
+      process.stdin.removeListener("data", onKey);
+      if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw ?? false);
+      if (code === 13) resolve("enter");
+      else resolve("esc");
+    }
+    process.stdin.on("data", onKey);
+  });
+
+  if (action !== "enter") {
+    console.log(chalk.dim("  Agents dialog dismissed\n"));
+    return;
+  }
+
+  // Step 1: Choose location
+  console.log("");
+  const locIdx = await boxSelect(
+    "Create new agent",
+    "Choose location",
+    ["Project (.chalk/agents/)", "Personal (~/.chalk/agents/)"],
+    "Up/Down to navigate - Enter to select - Esc to go back"
+  );
+  if (locIdx === -1) { console.log(chalk.dim("  Cancelled\n")); return; }
+  const location = locIdx === 0 ? "project" : "personal";
+
+  // Step 2: Choose creation method
+  console.log("");
+  const methodIdx = await boxSelect(
+    "Create new agent",
+    "Creation method",
+    ["Generate with Chalk (recommended)", "Manual configuration"],
+    "Up/Down to navigate - Enter to select - Esc to go back"
+  );
+  if (methodIdx === -1) { console.log(chalk.dim("  Cancelled\n")); return; }
+
+  // Step 3: Get description
+  console.log("");
+  const description = await boxTextInput(
+    "Create new agent",
+    "Describe what this agent should do and when it should be used",
+    "e.g., Help me write unit tests for my code..."
+  );
+  if (description === null || !description.trim()) {
+    console.log(chalk.dim("  Cancelled\n"));
+    return;
+  }
+
+  // Step 4: Get name
+  console.log("");
+  const agentName = await boxTextInput(
+    "Create new agent",
+    "Give your agent a name",
+    "e.g., Test Writer"
+  );
+  if (agentName === null || !agentName.trim()) {
+    console.log(chalk.dim("  Cancelled\n"));
+    return;
+  }
+
+  // Save agent
+  const agent = {
+    name: agentName.trim(),
+    description: description.trim(),
+    model: "inherit",
+    tools: ["tool_run", "tool_edit"],
+    createdAt: new Date().toISOString(),
+  };
+  saveAgent(agent, location);
+
+  const savedPath = location === "project" ? ".chalk/agents/" : "~/.chalk/agents/";
+  console.log("");
+  console.log(boxTop());
+  console.log(boxLine(chalk.green(`Agent "${agent.name}" created`)));
+  console.log(boxLine(chalk.dim(`Saved to ${savedPath}${agent.name.toLowerCase().replace(/\s+/g, "-")}.json`)));
+  console.log(boxEmpty());
+  console.log(boxLine(chalk.dim(`Description: ${agent.description}`)));
+  console.log(boxLine(chalk.dim(`Tools: ${agent.tools.join(", ")}`)));
+  console.log(boxBottom());
+  console.log("");
+}
+
+// ─── Slash Command Handlers ─────────────────────────────────────────────────
+
+async function handleSlashCommand(command, ctx) {
   const config = loadConfig();
 
   switch (command) {
@@ -416,13 +687,7 @@ function handleSlashCommand(command, ctx) {
       break;
 
     case "/agents":
-      console.log(chalk.cyan("\n  System Status:\n"));
-      console.log(`    ${chalk.white("Orchestrator".padEnd(20))} ${chalk.green("healthy")}`);
-      console.log(`    ${chalk.white("Tool Runner".padEnd(20))} ${chalk.green("healthy")}`);
-      console.log(`    ${chalk.white("File Editor".padEnd(20))} ${chalk.green("healthy")}`);
-      console.log(`    ${chalk.white("API Client".padEnd(20))} ${chalk.green("healthy")}`);
-      console.log(chalk.dim(`\n    Node ${process.version} | ${process.platform} | PID ${process.pid}`));
-      console.log(chalk.dim(`    Working in: ${process.cwd()}\n`));
+      await showAgentsDialog();
       break;
 
     case "/config":
@@ -787,16 +1052,16 @@ async function repl(config) {
     // Slash: "/" detected instantly on keypress -> show menu
     if (input.isSlash) {
       const cmd = await showSlashMenu();
-      if (cmd) handleSlashCommand(cmd, ctx);
+      if (cmd) await handleSlashCommand(cmd, ctx);
       continue;
     }
 
     // Direct slash command typed fully (e.g. "/help" then Enter)
     if (input.text.startsWith("/")) {
       const match = SLASH_COMMANDS.find((c) => c.name === input.text);
-      if (match) { handleSlashCommand(match.name, ctx); continue; }
+      if (match) { await handleSlashCommand(match.name, ctx); continue; }
       const partial = SLASH_COMMANDS.filter((c) => c.name.startsWith(input.text));
-      if (partial.length === 1) { handleSlashCommand(partial[0].name, ctx); continue; }
+      if (partial.length === 1) { await handleSlashCommand(partial[0].name, ctx); continue; }
       console.log(chalk.yellow(`  Unknown command: ${input.text}. Type / to see all.`));
       continue;
     }
