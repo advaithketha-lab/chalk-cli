@@ -389,27 +389,19 @@ async function showSlashMenu() {
   });
 }
 
-// ─── Box UI helpers (Claude Code style bordered dialogs) ────────────────────
+// ─── Panel UI (Chalk's own design: sidebar accent, step indicators) ─────────
 
-const BOX_WIDTH = 72;
-
-function boxTop()    { return chalk.dim("  +" + "-".repeat(BOX_WIDTH) + "+"); }
-function boxBottom() { return chalk.dim("  +" + "-".repeat(BOX_WIDTH) + "+"); }
-function boxLine(text, pad = true) {
-  const plain = text.replace(/\x1b\[[0-9;]*m/g, ""); // strip ANSI for length
-  const remaining = BOX_WIDTH - (pad ? 2 : 0) - plain.length;
-  const space = remaining > 0 ? " ".repeat(remaining) : "";
-  return chalk.dim("  |") + (pad ? " " : "") + text + space + (pad ? " " : "") + chalk.dim("|");
-}
-function boxEmpty() { return chalk.dim("  |") + " ".repeat(BOX_WIDTH) + chalk.dim("|"); }
+const BAR = chalk.cyan("  ::  ");
+const BAR_DIM = chalk.dim("  ::  ");
+const DIVIDER = chalk.dim("  ::  " + "~".repeat(58));
 
 /**
- * Generic raw-mode selector inside a box.
+ * Raw-mode list picker with Chalk's sidebar style.
  * Returns selected index or -1 on Esc.
  */
-function boxSelect(title, subtitle, items, footer) {
+function panelSelect(heading, hint, items, step) {
   return new Promise((resolve) => {
-    let selected = 0;
+    let sel = 0;
 
     if (!process.stdin.isTTY) { resolve(0); return; }
     const wasRaw = process.stdin.isRaw;
@@ -417,24 +409,22 @@ function boxSelect(title, subtitle, items, footer) {
     process.stdin.resume();
 
     function render(clear) {
-      const totalLines = items.length + 6 + (subtitle ? 1 : 0) + (footer ? 2 : 0);
-      if (clear) process.stdout.write(`\x1b[${totalLines}A\x1b[J`);
+      const lines = items.length + 5 + (step ? 1 : 0);
+      if (clear) process.stdout.write(`\x1b[${lines}A\x1b[J`);
 
-      console.log(boxTop());
-      console.log(boxLine(chalk.bold(title)));
-      if (subtitle) console.log(boxLine(chalk.dim(subtitle)));
-      console.log(boxEmpty());
+      if (step) console.log(BAR_DIM + chalk.dim(`step ${step}`));
+      console.log(BAR + chalk.bold.white(heading));
+      console.log(BAR_DIM + chalk.dim(hint));
+      console.log(DIVIDER);
       for (let i = 0; i < items.length; i++) {
-        const prefix = i === selected ? chalk.cyan("> ") : "  ";
-        const label = i === selected ? chalk.white(items[i]) : chalk.dim(items[i]);
-        console.log(boxLine(prefix + label));
+        if (i === sel) {
+          console.log(BAR + chalk.cyan(">> ") + chalk.white.bold(items[i]));
+        } else {
+          console.log(BAR_DIM + chalk.dim("   " + items[i]));
+        }
       }
-      console.log(boxEmpty());
-      console.log(boxBottom());
-      if (footer) {
-        console.log("");
-        console.log(chalk.dim(`  ${footer}`));
-      }
+      console.log(DIVIDER);
+      console.log(chalk.dim("      arrows move  |  enter picks  |  esc backs out"));
     }
 
     function cleanup() {
@@ -445,10 +435,10 @@ function boxSelect(title, subtitle, items, footer) {
     function onKey(data) {
       const code = data[0];
       if ((code === 27 && data.length === 1) || code === 3) { cleanup(); resolve(-1); return; }
-      if (code === 13) { cleanup(); resolve(selected); return; }
+      if (code === 13) { cleanup(); resolve(sel); return; }
       if (code === 27 && data.length >= 3) {
-        if (data[2] === 65) selected = Math.max(0, selected - 1);
-        if (data[2] === 66) selected = Math.min(items.length - 1, selected + 1);
+        if (data[2] === 65) sel = Math.max(0, sel - 1);
+        if (data[2] === 66) sel = Math.min(items.length - 1, sel + 1);
         render(true);
       }
     }
@@ -459,9 +449,10 @@ function boxSelect(title, subtitle, items, footer) {
 }
 
 /**
- * Text input inside a box. Returns string or null on Esc.
+ * Raw-mode text input with sidebar style.
+ * Returns string or null on Esc.
  */
-function boxTextInput(title, subtitle, placeholder) {
+function panelInput(heading, hint, placeholder, step) {
   return new Promise((resolve) => {
     let buf = "";
 
@@ -471,17 +462,16 @@ function boxTextInput(title, subtitle, placeholder) {
     process.stdin.resume();
 
     function render(clear) {
-      const totalLines = 7;
-      if (clear) process.stdout.write(`\x1b[${totalLines}A\x1b[J`);
+      const lines = 6 + (step ? 1 : 0);
+      if (clear) process.stdout.write(`\x1b[${lines}A\x1b[J`);
 
-      console.log(boxTop());
-      console.log(boxLine(chalk.bold(title)));
-      console.log(boxLine(chalk.dim(subtitle)));
-      console.log(boxEmpty());
-      const display = buf || chalk.dim(placeholder || "");
-      console.log(boxLine(display));
-      console.log(boxEmpty());
-      console.log(boxBottom());
+      if (step) console.log(BAR_DIM + chalk.dim(`step ${step}`));
+      console.log(BAR + chalk.bold.white(heading));
+      console.log(BAR_DIM + chalk.dim(hint));
+      console.log(DIVIDER);
+      console.log(BAR + (buf ? chalk.white(buf) : chalk.dim(placeholder || "type here...")));
+      console.log(DIVIDER);
+      console.log(chalk.dim("      enter submits  |  esc backs out"));
     }
 
     function cleanup() {
@@ -508,10 +498,11 @@ const AGENTS_DIR_PROJECT = path.join(process.cwd(), ".chalk", "agents");
 const AGENTS_DIR_PERSONAL = path.join(CHALK_HOME, "agents");
 
 const BUILTIN_AGENTS = [
-  { name: "Tool Runner",        model: "inherit", desc: "Executes shell commands via tool_run" },
-  { name: "File Editor",        model: "inherit", desc: "Creates and edits files via tool_edit" },
-  { name: "Code Reviewer",      model: "inherit", desc: "Reviews code for bugs and improvements" },
-  { name: "Security Reviewer",  model: "inherit", desc: "Checks code for security vulnerabilities" },
+  { name: "Tool Runner",       tag: "core",   desc: "Executes shell commands in the user's terminal" },
+  { name: "File Editor",       tag: "core",   desc: "Creates and modifies files in the workspace" },
+  { name: "Code Reviewer",     tag: "quality", desc: "Analyzes code for bugs, style, and best practices" },
+  { name: "Security Auditor",  tag: "quality", desc: "Scans for vulnerabilities and insecure patterns" },
+  { name: "Architect",         tag: "design", desc: "Plans project structure and technical decisions" },
 ];
 
 function loadCustomAgents() {
@@ -519,12 +510,11 @@ function loadCustomAgents() {
   for (const dir of [AGENTS_DIR_PROJECT, AGENTS_DIR_PERSONAL]) {
     if (!fs.existsSync(dir)) continue;
     try {
-      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-      for (const file of files) {
+      for (const file of fs.readdirSync(dir).filter((f) => f.endsWith(".json"))) {
         try {
           const data = JSON.parse(fs.readFileSync(path.join(dir, file), "utf-8"));
           agents.push({ ...data, location: dir === AGENTS_DIR_PROJECT ? "project" : "personal" });
-        } catch { /* skip bad files */ }
+        } catch { /* skip */ }
       }
     } catch { /* skip */ }
   }
@@ -541,102 +531,105 @@ function saveAgent(agent, location) {
 async function showAgentsDialog() {
   const custom = loadCustomAgents();
 
-  // Main agents screen
+  // ── Dashboard view ──
   console.log("");
-  console.log(boxTop());
-  console.log(boxLine(chalk.bold("Agents")));
-  if (custom.length === 0) {
-    console.log(boxLine(chalk.dim("No custom agents found")));
-  } else {
-    console.log(boxLine(chalk.dim(`${custom.length} custom agent(s)`)));
-  }
-  console.log(boxEmpty());
-  console.log(boxLine(chalk.cyan("> Create new agent")));
-  console.log(boxEmpty());
+  console.log(BAR + chalk.bold.cyan("Agent Hub"));
+  console.log(DIVIDER);
+  console.log("");
 
-  // Show description
-  console.log(boxLine(chalk.dim("Create specialized subagents that Chalk can delegate to.")));
-  console.log(boxLine(chalk.dim("Each subagent has its own context window, custom system prompt,")));
-  console.log(boxLine(chalk.dim("and specific tools.")));
-  console.log(boxLine(chalk.dim("Try creating: Code Reviewer, Security Reviewer, Tech Lead.")));
-  console.log(boxEmpty());
+  // Custom agents
+  if (custom.length > 0) {
+    console.log(BAR + chalk.white("Your Agents:"));
+    for (const a of custom) {
+      const loc = a.location === "project" ? chalk.blue("[project]") : chalk.magenta("[personal]");
+      console.log(BAR_DIM + `  ${chalk.white(a.name)}  ${loc}  ${chalk.dim(a.description || "")}`);
+    }
+    console.log("");
+  } else {
+    console.log(BAR_DIM + chalk.dim("No custom agents yet. Create one below."));
+    console.log("");
+  }
 
   // Built-in agents
-  console.log(boxLine(chalk.bold("Built-in (always available):")));
+  console.log(BAR + chalk.white("Built-in Agents:"));
   for (const a of BUILTIN_AGENTS) {
-    console.log(boxLine(`${chalk.white(a.name.padEnd(22))}${chalk.dim(a.model)}`));
+    const tagColor = a.tag === "core" ? chalk.green : a.tag === "quality" ? chalk.yellow : chalk.blue;
+    console.log(BAR_DIM + `  ${chalk.white(a.name.padEnd(20))} ${tagColor(a.tag.padEnd(9))} ${chalk.dim(a.desc)}`);
   }
-  console.log(boxEmpty());
-  console.log(boxBottom());
-  console.log(chalk.dim("\n  Press Enter to create - Esc to go back\n"));
+  console.log("");
+  console.log(DIVIDER);
+  console.log(chalk.dim("      enter = new agent  |  esc = back"));
+  console.log("");
 
-  // Wait for Enter or Esc
+  // Wait for action
   const action = await new Promise((resolve) => {
     if (!process.stdin.isTTY) { resolve("esc"); return; }
     const wasRaw = process.stdin.isRaw;
     process.stdin.setRawMode(true);
     process.stdin.resume();
     function onKey(data) {
-      const code = data[0];
       process.stdin.removeListener("data", onKey);
       if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw ?? false);
-      if (code === 13) resolve("enter");
-      else resolve("esc");
+      resolve(data[0] === 13 ? "enter" : "esc");
     }
     process.stdin.on("data", onKey);
   });
 
-  if (action !== "enter") {
-    console.log(chalk.dim("  Agents dialog dismissed\n"));
-    return;
-  }
+  if (action !== "enter") return;
 
-  // Step 1: Choose location
+  // ── Creation Wizard ──
   console.log("");
-  const locIdx = await boxSelect(
-    "Create new agent",
-    "Choose location",
-    ["Project (.chalk/agents/)", "Personal (~/.chalk/agents/)"],
-    "Up/Down to navigate - Enter to select - Esc to go back"
+  console.log(BAR + chalk.bold.cyan("New Agent Wizard"));
+  console.log(DIVIDER);
+  console.log("");
+
+  // Step 1: Where to save
+  const locIdx = await panelSelect(
+    "Where should this agent live?",
+    "Project agents are shared with your team. Personal agents follow you everywhere.",
+    [
+      "This project  (.chalk/agents/)",
+      "Personal      (~/.chalk/agents/)",
+    ],
+    "1/4"
   );
-  if (locIdx === -1) { console.log(chalk.dim("  Cancelled\n")); return; }
+  if (locIdx === -1) return;
   const location = locIdx === 0 ? "project" : "personal";
 
-  // Step 2: Choose creation method
+  // Step 2: How to create
   console.log("");
-  const methodIdx = await boxSelect(
-    "Create new agent",
-    "Creation method",
-    ["Generate with Chalk (recommended)", "Manual configuration"],
-    "Up/Down to navigate - Enter to select - Esc to go back"
+  const methodIdx = await panelSelect(
+    "How do you want to set it up?",
+    "Chalk can generate a system prompt from your description, or you write it yourself.",
+    [
+      "Describe it and let Chalk figure it out",
+      "I'll configure everything manually",
+    ],
+    "2/4"
   );
-  if (methodIdx === -1) { console.log(chalk.dim("  Cancelled\n")); return; }
+  if (methodIdx === -1) return;
 
-  // Step 3: Get description
+  // Step 3: Description
   console.log("");
-  const description = await boxTextInput(
-    "Create new agent",
-    "Describe what this agent should do and when it should be used",
-    "e.g., Help me write unit tests for my code..."
+  const description = await panelInput(
+    "What should this agent do?",
+    "Be specific. This becomes the agent's mission.",
+    "e.g., Review my pull requests for performance issues...",
+    "3/4"
   );
-  if (description === null || !description.trim()) {
-    console.log(chalk.dim("  Cancelled\n"));
-    return;
-  }
+  if (!description?.trim()) return;
 
-  // Step 4: Get name
+  // Step 4: Name
   console.log("");
-  const agentName = await boxTextInput(
-    "Create new agent",
-    "Give your agent a name",
-    "e.g., Test Writer"
+  const agentName = await panelInput(
+    "Give it a name",
+    "Short and memorable. You'll use this to summon it.",
+    "e.g., Perf Reviewer",
+    "4/4"
   );
-  if (agentName === null || !agentName.trim()) {
-    console.log(chalk.dim("  Cancelled\n"));
-    return;
-  }
+  if (!agentName?.trim()) return;
 
-  // Save agent
+  // Save
   const agent = {
     name: agentName.trim(),
     description: description.trim(),
@@ -646,15 +639,15 @@ async function showAgentsDialog() {
   };
   saveAgent(agent, location);
 
-  const savedPath = location === "project" ? ".chalk/agents/" : "~/.chalk/agents/";
+  // Confirmation
   console.log("");
-  console.log(boxTop());
-  console.log(boxLine(chalk.green(`Agent "${agent.name}" created`)));
-  console.log(boxLine(chalk.dim(`Saved to ${savedPath}${agent.name.toLowerCase().replace(/\s+/g, "-")}.json`)));
-  console.log(boxEmpty());
-  console.log(boxLine(chalk.dim(`Description: ${agent.description}`)));
-  console.log(boxLine(chalk.dim(`Tools: ${agent.tools.join(", ")}`)));
-  console.log(boxBottom());
+  console.log(BAR + chalk.green.bold("Agent created"));
+  console.log(DIVIDER);
+  console.log(BAR_DIM + chalk.white("Name:  ") + agent.name);
+  console.log(BAR_DIM + chalk.white("Scope: ") + (location === "project" ? "this project" : "personal (global)"));
+  console.log(BAR_DIM + chalk.white("Tools: ") + agent.tools.join(", "));
+  console.log(BAR_DIM + chalk.white("Desc:  ") + chalk.dim(agent.description));
+  console.log(DIVIDER);
   console.log("");
 }
 
